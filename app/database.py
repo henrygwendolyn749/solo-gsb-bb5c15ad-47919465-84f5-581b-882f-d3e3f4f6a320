@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS logs (
     min_voltage   REAL,
     max_voltage   REAL,
     max_temp_c    REAL,
-    cell_info     TEXT
+    cell_info     TEXT,
+    audit         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -75,6 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_cycles_battery ON cycles(battery_id, id);
 # 旧版数据库补列（SQLite 不支持 CREATE TABLE IF 里的 ADD COLUMN，逐项 ALTER）
 _MIGRATIONS = [
     ("logs", "cell_info", "ALTER TABLE logs ADD COLUMN cell_info TEXT"),
+    ("logs", "audit", "ALTER TABLE logs ADD COLUMN audit TEXT"),
     ("samples", "cells", "ALTER TABLE samples ADD COLUMN cells TEXT"),
     ("cycles", "cell_count",
      "ALTER TABLE cycles ADD COLUMN cell_count INTEGER NOT NULL DEFAULT 0"),

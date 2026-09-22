@@ -7,6 +7,10 @@
 
 - **电池档案**：设置额定容量 (Ah) 与安全电压范围 (V)，可随时修改
 - **日志导入**：上传包含 `时间 / 电压 / 电流 / 温度` 四列的 CSV（自动识别常见中英文列名与分隔符）
+- **导入前数据质量审计**：在保留原始行号的原始数据上检查时间戳乱序、重复时间、
+  异常采样间隔与电压/电流/温度稳健离群点，相邻问题自动合并为质量区段（标明类型、
+  起止行、时间范围与受影响字段）；审计只提示问题，**不阻断可解析行的循环分析**，
+  证据随导入结果、日志详情与导出 JSON 一并保留
 - **循环识别**：三态状态机（静置 / 放电 / 充电）划定循环边界，自动合并瞬时噪声段
 - **容量估算**：梯形库仑积分计算每循环容量 (Ah) 与能量 (Wh)
 - **内阻估算**：利用负载加载/卸载瞬间的电压跳变与静置段电压恢复估算直流内阻 (mΩ)
@@ -42,14 +46,16 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 演示数据
 
 ```bash
-python3 scripts/generate_sample.py   # 生成 sample_data/sample_flight_1.csv 与 _2.csv
+python3 scripts/generate_sample.py   # 生成 sample_data/sample_flight_1.csv ~ _3.csv
 ```
 
 在页面中新建电池（例如：额定容量 `2.2` Ah，安全电压 `19.8` ~ `25.2` V），
-依次上传两份 CSV 即可看到循环识别、容量衰减、异常发热与未闭合循环标记。
-两份样例均含 6 节单体电压：样例 1 只有一次瞬时压差尖峰（不告警）；样例 2 第 6 节
+依次上传 CSV 即可看到循环识别、容量衰减、异常发热与未闭合循环标记。
+样例 1、2 均含 6 节单体电压：样例 1 只有一次瞬时压差尖峰（不告警）；样例 2 第 6 节
 单体持续偏弱并带有 4 s 采样断点与一行缺值（生成单体失衡标记，区间被断点切分，
-缺值行被跳过）。
+缺值行被跳过；该 4 s 断点也会被质量审计标记为采样间隔异常）。
+样例 3 循环分析正常，但注入了四类数据质量问题（时间戳乱序、重复时间、异常采样
+间隔、电压/电流/温度离群尖峰），用于演示导入前质量审计的区段合并与筛选。
 
 ## CSV 格式
 
@@ -85,6 +91,39 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
   该行仍参与总压、电流、温度的全部分析。
 - 导入结果中返回识别到的单体列名、有效行数与各类跳过原因。
 
+## 数据质量审计
+
+每次导入在解析之前先对**原始 CSV 行**做一次只读质量审计（保留原始行号，
+表头为第 1 行，空行不占行号），检查四类问题：
+
+| 类型 | 判定规则 |
+| --- | --- |
+| `time_out_of_order` 时间戳乱序 | 当前行时间早于上一有效时间行 |
+| `time_duplicate` 重复时间 | 相邻有效时间行时间差为 0 |
+| `interval_abnormal` 采样间隔异常 | 间隔 > 全文件中位间隔 × 3（过大）或 < 中位间隔 ÷ 3（过密），至少 8 个有效间隔才评估 |
+| `outlier` 数值离群 | 电压/电流/温度相对**双侧局部邻域中位数**（左右各 8 行）的孤立尖峰：两侧修正 z 分数均 > 4.0，噪声尺度取 1.4826×邻域 MAD 与字段下限（0.05V / 0.05A / 0.5°C）的较大者 |
+
+离群检测采用局部邻域而非全局分布：飞行日志是多工况时间序列（静置 / 放电 /
+充电的电流水准与噪声水平不同、温度缓慢漂移），全局检验会把合法工况误判为离群；
+双侧检验下阶跃式工况切换只有一侧偏离，不会误报。持续超过邻域窗口的整段异常
+不属于"孤立尖峰"，不在本检查范围内。
+
+**质量区段**：行号相邻（间隔 ≤ 3 行）的同类问题合并为一个区段，标明类型、
+起止行、时间范围（相对秒；epoch/ISO 时间戳日志另附墙钟时间）、受影响字段、
+问题行数与行号清单，并保留最多 3 行样例作为证据。日志详情页提供按类型筛选
+区段与质量摘要（质量评分 = 100 − 问题行占比% − 每区段 3 分；
+≥95 良好 / ≥80 一般 / 其余较差）。
+
+**不阻断保证**：审计只读原始文本、绝不抛异常（审计失败仅记录 `error`），
+所有可解析行照常完成循环分析；无法解析的行由导入器计入 `skipped_rows`，
+不参与对应检查。
+
+**证据保留**：审计结果以 JSON 存入 `logs.audit` 字段，并出现在——
+
+- 导入响应 `audit`（摘要 + 全部区段）；
+- 日志列表 `audit_summary`（仅摘要）与日志详情 `log.audit`；
+- 评估接口与导出 JSON 的 `log_audits`（按日志归档的完整审计证据）。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -93,17 +132,17 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 | POST | `/api/batteries` | 新建电池（额定容量、安全电压范围） |
 | GET | `/api/batteries` | 电池列表（含日志数、放电循环数） |
 | GET / PATCH / DELETE | `/api/batteries/{id}` | 查询 / 修改 / 删除电池 |
-| POST | `/api/batteries/{id}/logs` | 上传 CSV 并完成循环分析（multipart） |
-| GET | `/api/batteries/{id}/logs` | 该电池的日志列表 |
-| GET / DELETE | `/api/logs/{id}` | 日志详情（样本 + 循环）/ 删除 |
-| GET | `/api/batteries/{id}/assessment` | 汇总评估（摘要、标记、趋势、循环明细） |
-| GET | `/api/batteries/{id}/export` | 下载评估 JSON 文件 |
+| POST | `/api/batteries/{id}/logs` | 上传 CSV：质量审计 + 循环分析（multipart，响应含 `audit`） |
+| GET | `/api/batteries/{id}/logs` | 该电池的日志列表（含 `audit_summary` 质量摘要） |
+| GET / DELETE | `/api/logs/{id}` | 日志详情（样本 + 循环 + `log.audit` 审计区段）/ 删除 |
+| GET | `/api/batteries/{id}/assessment` | 汇总评估（摘要、标记、趋势、循环明细、`log_audits`） |
+| GET | `/api/batteries/{id}/export` | 下载评估 JSON 文件（含各日志审计证据） |
 
 交互式 API 文档：<http://localhost:8000/docs>
 
 ## 判定规则与阈值
 
-阈值常量集中在 `app/analysis.py`，可按机型调整：
+阈值常量集中在 `app/analysis.py`（循环与判定）与 `app/audit.py`（质量审计），可按机型调整：
 
 | 规则 | 默认值 |
 | --- | --- |
@@ -116,6 +155,9 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 | 单体压差超差阈值 | 0.10 V（max(cell) − min(cell)） |
 | 单体失衡持续时长 | ≥ 5 s（连续超差才告警，短暂尖峰不告警） |
 | 单体采样断点 | 相邻有效单体样本间隔 > 2 s 中断连续区间 |
+| 审计：采样间隔异常 | > 中位间隔 × 3 或 < 中位间隔 ÷ 3 |
+| 审计：离群点 | 双侧邻域（各 8 行）中位数检验，修正 z > 4.0 |
+| 审计：区段合并 | 同类问题行号间隔 ≤ 3 行合并为一个质量区段 |
 | 健康等级 | 综合严重标记数、SOH（<60/70/85%）与衰减率分档 |
 
 **单体失衡判定**：对每个已识别循环，取该行各单体电压的最大压差
@@ -136,10 +178,12 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 ```
 app/
   main.py        FastAPI 路由与启动钩子（启动时初始化 SQLite）
-  database.py    SQLite 连接与建表
+  database.py    SQLite 连接与建表（含旧库列迁移）
   analysis.py    状态机循环识别、库仑积分、内阻估算、单体压差连续性判定、判定与汇总
-  importer.py    CSV 解析（列名别名、单体列识别、分隔符嗅探、时间归一化）
+  audit.py       导入前数据质量审计（乱序/重复/间隔/离群、质量区段合并）
+  importer.py    CSV 解析（列名别名、单体列识别、分隔符嗅探、时间归一化、原始行号）
   static/        原生前端（index.html / app.js / style.css）
-scripts/generate_sample.py   演示数据生成器
+scripts/generate_sample.py   演示数据生成器（3 份样例）
+tests/test_audit.py           审计与导入管线单元测试（pytest 或直接 python3 运行）
 Dockerfile / docker-compose.yml
 ```

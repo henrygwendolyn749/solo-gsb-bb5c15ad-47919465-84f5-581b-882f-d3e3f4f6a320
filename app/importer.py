@@ -106,11 +106,20 @@ def _parse_time_value(s: str):
     return dt.timestamp(), True
 
 
-def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
-    """解析 CSV 文本，返回 (按时间排序的样本列表, 元信息)。
+def try_parse_time(s: str):
+    """容错版时间解析：成功返回 (秒数值, 是否 epoch)，失败返回 None。"""
+    try:
+        return _parse_time_value(s)
+    except CsvFormatError:
+        return None
 
-    单体电压列为可选：识别到且编号连续时按行成组解析；某行缺值或单体数量漂移，
-    仅跳过该行的单体分析（记录原因），总压/电流/温度的主分析不受影响。
+
+def split_csv_rows(text: str) -> tuple[list[str], list[tuple[int, list[str]]]]:
+    """嗅探分隔符并拆分 CSV，返回 (表头, [(原始行号, 行)])。
+
+    行号为 1-based 的原始记录行号（表头通常为 1）；空行被剔除但其行号保留占位，
+    因此数据行号始终与原始文件一致，供质量审计与跳过原因定位使用。
+    无任何有效行时返回 ([], [])。
     """
     sample_text = text[:4096]
     try:
@@ -118,18 +127,37 @@ def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
     except csv.Error:
         dialect = csv.excel
     reader = csv.reader(io.StringIO(text), dialect)
-    rows = [r for r in reader if any(cell.strip() for cell in r)]
-    if len(rows) < 2:
+    rows = [(line_no, row) for line_no, row in enumerate(reader, start=1)
+            if any(cell.strip() for cell in row)]
+    if not rows:
+        return [], []
+    return rows[0][1], rows[1:]
+
+
+def match_log_columns(headers: list[str]) -> dict:
+    """匹配四类必需列，返回 {"time": 列索引|None, "voltage": ..., ...}。"""
+    return {
+        "time": _match_column(headers, _TIME_ALIASES),
+        "voltage": _match_column(headers, _VOLT_ALIASES),
+        "current": _match_column(headers, _CURR_ALIASES),
+        "temperature": _match_column(headers, _TEMP_ALIASES),
+    }
+
+
+def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
+    """解析 CSV 文本，返回 (按时间排序的样本列表, 元信息)。
+
+    单体电压列为可选：识别到且编号连续时按行成组解析；某行缺值或单体数量漂移，
+    仅跳过该行的单体分析（记录原因，行号为原始行号），总压/电流/温度的主分析不受影响。
+    """
+    headers, data_rows = split_csv_rows(text)
+    if not headers or not data_rows:
         raise CsvFormatError("CSV 内容为空或缺少数据行")
 
-    headers = rows[0]
-    ci_t = _match_column(headers, _TIME_ALIASES)
-    ci_v = _match_column(headers, _VOLT_ALIASES)
-    ci_i = _match_column(headers, _CURR_ALIASES)
-    ci_tp = _match_column(headers, _TEMP_ALIASES)
-    missing = [name for name, idx in
-               (("time", ci_t), ("voltage", ci_v), ("current", ci_i),
-                ("temperature", ci_tp)) if idx is None]
+    cols = match_log_columns(headers)
+    ci_t, ci_v, ci_i, ci_tp = (cols["time"], cols["voltage"],
+                               cols["current"], cols["temperature"])
+    missing = [name for name, idx in cols.items() if idx is None]
     if missing:
         raise CsvFormatError(
             f"缺少必需列: {', '.join(missing)}；识别到的表头: {headers}")
@@ -149,7 +177,7 @@ def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
     skipped = 0
     t0 = None
     epoch_based = False
-    for line_no, row in enumerate(rows[1:], start=2):
+    for line_no, row in data_rows:
         try:
             tv, is_epoch = _parse_time_value(row[ci_t])
             v = float(row[ci_v])

@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from .analysis import (build_assessment, detect_cycles, evaluate_cycle,
                        evaluate_cell_balance)
+from .audit import audit_csv_text
 from .database import get_conn, init_db
 from .importer import CsvFormatError, decode_text, parse_flight_csv
 
@@ -149,8 +150,11 @@ def import_log(bid: int, file: UploadFile = File(...)):
         raw = file.file.read()
         if not raw:
             raise HTTPException(400, "上传文件为空")
+        text = decode_text(raw)
+        # 导入前数据质量审计：只读原始行、保留原始行号，任何审计发现都不阻断导入
+        audit = audit_csv_text(text)
         try:
-            samples, meta = parse_flight_csv(decode_text(raw))
+            samples, meta = parse_flight_csv(text)
         except CsvFormatError as exc:
             raise HTTPException(422, f"CSV 解析失败: {exc}")
 
@@ -164,11 +168,12 @@ def import_log(bid: int, file: UploadFile = File(...)):
         cur = conn.execute(
             "INSERT INTO logs(battery_id, filename, imported_at, start_time,"
             " duration_s, row_count, max_current_a, min_voltage, max_voltage,"
-            " max_temp_c, cell_info) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            " max_temp_c, cell_info, audit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (bid, file.filename or "upload.csv", _now_iso(), meta["start_time"],
              meta["duration_s"], meta["row_count"], meta["max_current_a"],
              meta["min_voltage"], meta["max_voltage"], meta["max_temp_c"],
-             json.dumps(meta["cells"], ensure_ascii=False)))
+             json.dumps(meta["cells"], ensure_ascii=False),
+             json.dumps(audit, ensure_ascii=False)))
         log_id = cur.lastrowid
         conn.executemany(
             "INSERT INTO samples(log_id, t, voltage, current, temperature, cells)"
@@ -203,7 +208,7 @@ def import_log(bid: int, file: UploadFile = File(...)):
         log = dict(conn.execute("SELECT * FROM logs WHERE id=?",
                                 (log_id,)).fetchone())
         return {"log": log, "skipped_rows": meta["skipped_rows"],
-                "cells": meta["cells"],
+                "cells": meta["cells"], "audit": audit,
                 "cycles": [c.to_dict() for c in cycles]}
     finally:
         conn.close()
@@ -221,7 +226,14 @@ def list_logs(bid: int):
             " (SELECT COUNT(*) FROM cycles c WHERE c.log_id=l.id"
             "   AND c.kind='charge') AS charge_cycles"
             " FROM logs l WHERE l.battery_id=? ORDER BY l.id", (bid,)).fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            raw_audit = d.pop("audit", None)  # 列表只带摘要，区段明细见日志详情
+            d["audit_summary"] = (json.loads(raw_audit)["summary"]
+                                  if raw_audit else None)
+            out.append(d)
+        return out
     finally:
         conn.close()
 
@@ -250,6 +262,8 @@ def get_log(log_id: int, max_points: int = 3000):
         log_dict = dict(log)
         log_dict["cell_info"] = (json.loads(log_dict["cell_info"])
                                  if log_dict["cell_info"] else None)
+        log_dict["audit"] = (json.loads(log_dict["audit"])
+                             if log_dict.get("audit") else None)
         return {"log": log_dict, "samples": samples, "cycles": cycles}
     finally:
         conn.close()
@@ -282,7 +296,19 @@ def _build_battery_assessment(conn, bid: int) -> dict:
         cycles.append(c)
     log_count = conn.execute(
         "SELECT COUNT(*) AS n FROM logs WHERE battery_id=?", (bid,)).fetchone()["n"]
+    # 各日志的导入前质量审计证据（随评估与导出 JSON 一并保留）
+    log_audits = []
+    for lr in conn.execute(
+            "SELECT id, filename, imported_at, audit FROM logs"
+            " WHERE battery_id=? ORDER BY id", (bid,)).fetchall():
+        log_audits.append({
+            "log_id": lr["id"],
+            "filename": lr["filename"],
+            "imported_at": lr["imported_at"],
+            "audit": json.loads(lr["audit"]) if lr["audit"] else None,
+        })
     result = build_assessment(battery, cycles, log_count)
+    result["log_audits"] = log_audits
     result["battery"] = battery
     result["generated_at"] = _now_iso()
     return result

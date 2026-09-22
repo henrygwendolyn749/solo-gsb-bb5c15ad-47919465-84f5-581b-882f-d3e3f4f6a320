@@ -2,7 +2,7 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { batteries: [], currentId: null, currentLogId: null, logDetail: null };
+const state = { batteries: [], currentId: null, currentLogId: null, logDetail: null, auditFilter: "all" };
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
@@ -168,9 +168,19 @@ $("#btn-upload").onclick = async () => {
         msg += `识别到单体列但未启用单体分析（${r.cells.disabled_reason}）。`;
       }
     }
+    if (r.audit && r.audit.summary && !r.audit.summary.error) {
+      const s = r.audit.summary;
+      msg += `质量审计：评分 ${s.quality_score}（${s.quality_label}），` +
+        `问题行 ${s.issue_rows}/${s.total_rows}、质量区段 ${s.segment_count} 个` +
+        (s.segment_count ? "，可在下方日志详情中按类型筛选查看。" : "。");
+    }
     $("#upload-result").textContent = msg;
     input.value = "";
     await Promise.all([loadAssessment(), loadLogs(), loadBatteries(true)]);
+    // 自动打开新导入日志的详情（含质量审计区段）
+    const row = [...document.querySelectorAll("#logs-table tbody tr")]
+      .find((tr) => Number(tr.children[0].textContent) === Number(r.log.id));
+    if (row) selectLog(r.log.id, row);
   } catch (err) {
     $("#upload-result").textContent = "";
     toast(err.message, true);
@@ -183,8 +193,13 @@ async function loadLogs() {
   tbody.innerHTML = "";
   for (const l of logs) {
     const tr = document.createElement("tr");
+    const q = l.audit_summary;
+    const qHtml = q && q.quality_score !== null && q.quality_score !== undefined
+      ? `<span class="quality ${q.quality_grade}">${q.quality_score}</span>`
+      : `<span class="muted">—</span>`;
     tr.innerHTML = `<td>${l.id}</td><td></td><td>${fmtTime(l.imported_at)}</td>
       <td>${fmtDur(l.duration_s)}</td><td>${l.row_count}</td>
+      <td>${qHtml}</td>
       <td>${l.discharge_cycles} / ${l.charge_cycles}</td>
       <td><button class="danger" data-del="${l.id}">删除</button></td>`;
     tr.children[1].textContent = l.filename;
@@ -208,7 +223,7 @@ async function loadLogs() {
     tbody.appendChild(tr);
   }
   if (!logs.length) {
-    tbody.innerHTML = `<tr><td colspan="7" class="muted">暂无日志，请上传 CSV。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">暂无日志，请上传 CSV。</td></tr>`;
   }
 }
 
@@ -256,6 +271,7 @@ async function loadAssessment() {
 
 async function selectLog(logId, rowEl) {
   state.currentLogId = logId;
+  state.auditFilter = "all";
   document.querySelectorAll("#logs-table tbody tr").forEach((tr) =>
     tr.classList.toggle("selected", tr === rowEl));
   try {
@@ -264,10 +280,121 @@ async function selectLog(logId, rowEl) {
     $("#log-detail").hidden = false;
     $("#log-title").textContent =
       `日志 #${logId}：${d.log.filename}（${d.log.row_count} 行样本）`;
+    renderAudit(d.log.audit);
     renderCyclesTable(d.cycles);
     drawLogChart(d.samples, d.cycles);
     $("#log-detail").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (err) { toast(err.message, true); }
+}
+
+/* ---------------- 数据质量审计 ---------------- */
+
+function renderAudit(audit) {
+  const sumEl = $("#audit-summary-line");
+  const filtersEl = $("#audit-filters");
+  const listEl = $("#audit-segments");
+  filtersEl.innerHTML = "";
+  listEl.innerHTML = "";
+  if (!audit || !audit.summary) {
+    sumEl.textContent = "（无审计数据）";
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = "该日志导入于审计功能上线前，未生成质量审计。";
+    listEl.appendChild(li);
+    return;
+  }
+  const s = audit.summary;
+  if (s.error) {
+    sumEl.textContent = `（审计未完成：${s.error}）`;
+    return;
+  }
+  sumEl.textContent =
+    `质量评分 ${s.quality_score}（${s.quality_label}） · ` +
+    `问题行 ${s.issue_rows}/${s.total_rows} · 质量区段 ${s.segment_count} 个` +
+    (s.median_interval_s ? ` · 中位采样间隔 ${s.median_interval_s}s` : "");
+
+  // 区段类型筛选
+  const filters = [["all", `全部 ${s.issue_count}`, false]];
+  for (const [key, info] of Object.entries(s.by_type)) {
+    filters.push([key, `${info.label} ${info.issues}`, info.issues === 0]);
+  }
+  for (const [key, label, disabled] of filters) {
+    const btn = document.createElement("button");
+    btn.className = "audit-filter" + (state.auditFilter === key ? " active" : "");
+    btn.textContent = label;
+    btn.disabled = disabled;
+    btn.onclick = () => { state.auditFilter = key; renderAudit(audit); };
+    filtersEl.appendChild(btn);
+  }
+
+  const segs = (audit.segments || []).filter((seg) =>
+    state.auditFilter === "all" || seg.type === state.auditFilter);
+  if (!segs.length) {
+    const li = document.createElement("li");
+    li.className = "muted";
+    li.textContent = s.segment_count ? "该类型下没有质量区段。"
+                                     : "未发现数据质量问题。";
+    listEl.appendChild(li);
+    return;
+  }
+  for (const seg of segs) listEl.appendChild(buildSegmentEl(seg));
+}
+
+function buildSegmentEl(seg) {
+  const li = document.createElement("li");
+  li.className = `audit-seg ${seg.type}`;
+
+  const head = document.createElement("div");
+  head.className = "seg-head";
+  const badge = document.createElement("span");
+  badge.className = "badge";
+  badge.textContent = seg.type_label;
+  head.appendChild(badge);
+  const linesSpan = document.createElement("span");
+  linesSpan.className = "seg-lines";
+  linesSpan.textContent = `第 ${seg.start_line}~${seg.end_line} 行 · ${seg.issue_count} 处`;
+  head.appendChild(linesSpan);
+  const timeSpan = document.createElement("span");
+  timeSpan.className = "seg-time";
+  timeSpan.textContent = seg.start_time
+    ? `${fmtTime(seg.start_time)} ~ ${fmtTime(seg.end_time)}`
+    : (seg.start_t !== null && seg.start_t !== undefined
+       ? `t=${seg.start_t}s ~ ${seg.end_t}s` : "");
+  head.appendChild(timeSpan);
+  li.appendChild(head);
+
+  const fields = document.createElement("div");
+  fields.className = "seg-fields";
+  fields.textContent = `受影响字段：${seg.field_labels.join("、")}`;
+  li.appendChild(fields);
+
+  const detail = document.createElement("div");
+  detail.className = "seg-detail";
+  detail.textContent = seg.detail;
+  li.appendChild(detail);
+
+  const linesNote = document.createElement("div");
+  linesNote.className = "seg-lines-detail";
+  linesNote.textContent = `行号：${seg.lines.join("、")}` +
+    (seg.lines_truncated ? ` …（仅列前 ${seg.lines.length} 行）` : "");
+  li.appendChild(linesNote);
+
+  if (seg.examples && seg.examples.length) {
+    const ul = document.createElement("ul");
+    ul.className = "seg-examples";
+    for (const ex of seg.examples) {
+      const item = document.createElement("li");
+      const when = ex.time ? fmtTime(ex.time)
+        : (ex.t !== undefined ? `t=${ex.t}s` : "");
+      const vals = ex.values && Object.keys(ex.values).length
+        ? " [" + Object.entries(ex.values).map(([k, v]) => `${k}=${v}`).join(", ") + "]"
+        : "";
+      item.textContent = `第 ${ex.line} 行${when ? " · " + when : ""}：${ex.detail}${vals}`;
+      ul.appendChild(item);
+    }
+    li.appendChild(ul);
+  }
+  return li;
 }
 
 function renderCyclesTable(cycles) {
