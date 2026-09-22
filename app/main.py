@@ -61,6 +61,22 @@ def _check_voltages(vmin: float, vmax: float) -> None:
         raise HTTPException(422, "安全电压下限必须小于上限")
 
 
+def _quality_brief(audit: Optional[str]) -> Optional[dict]:
+    """从 logs.quality_audit JSON 提取列表页用的紧凑质量摘要。"""
+    if not audit:
+        return None
+    data = json.loads(audit)
+    return {
+        "segment_count": data.get("segment_count", 0),
+        "issue_count": data.get("issue_count", 0),
+        "time_ordered": data.get("time_ordered", True),
+        "counts_by_severity": data.get("counts_by_severity", {}),
+        "counts_by_type": data.get("counts_by_type", {}),
+        "affected_fields": data.get("affected_fields", []),
+        "skipped_rows": data.get("skipped_rows", 0),
+    }
+
+
 # ---------------------------------------------------------------- 电池 CRUD
 
 @app.get("/api/health")
@@ -164,17 +180,20 @@ def import_log(bid: int, file: UploadFile = File(...)):
         cur = conn.execute(
             "INSERT INTO logs(battery_id, filename, imported_at, start_time,"
             " duration_s, row_count, max_current_a, min_voltage, max_voltage,"
-            " max_temp_c, cell_info) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            " max_temp_c, cell_info, quality_audit)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (bid, file.filename or "upload.csv", _now_iso(), meta["start_time"],
              meta["duration_s"], meta["row_count"], meta["max_current_a"],
              meta["min_voltage"], meta["max_voltage"], meta["max_temp_c"],
-             json.dumps(meta["cells"], ensure_ascii=False)))
+             json.dumps(meta["cells"], ensure_ascii=False),
+             json.dumps(meta["quality_audit"], ensure_ascii=False)))
         log_id = cur.lastrowid
         conn.executemany(
-            "INSERT INTO samples(log_id, t, voltage, current, temperature, cells)"
-            " VALUES(?,?,?,?,?,?)",
+            "INSERT INTO samples(log_id, t, voltage, current, temperature, cells, line_no)"
+            " VALUES(?,?,?,?,?,?,?)",
             [(log_id, s.t, s.v, s.i, s.temp,
-              json.dumps(list(s.cells)) if s.cells is not None else None)
+              json.dumps(list(s.cells)) if s.cells is not None else None,
+              s.line_no)
              for s in samples])
         start_epoch = None
         if meta["start_time"]:
@@ -202,8 +221,13 @@ def import_log(bid: int, file: UploadFile = File(...)):
         conn.commit()
         log = dict(conn.execute("SELECT * FROM logs WHERE id=?",
                                 (log_id,)).fetchone())
+        log["cell_info"] = (json.loads(log["cell_info"])
+                            if log["cell_info"] else None)
+        log["quality_audit"] = (json.loads(log["quality_audit"])
+                                if log["quality_audit"] else None)
         return {"log": log, "skipped_rows": meta["skipped_rows"],
                 "cells": meta["cells"],
+                "quality_audit": meta["quality_audit"],
                 "cycles": [c.to_dict() for c in cycles]}
     finally:
         conn.close()
@@ -221,7 +245,10 @@ def list_logs(bid: int):
             " (SELECT COUNT(*) FROM cycles c WHERE c.log_id=l.id"
             "   AND c.kind='charge') AS charge_cycles"
             " FROM logs l WHERE l.battery_id=? ORDER BY l.id", (bid,)).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        for r in result:
+            r["quality"] = _quality_brief(r.pop("quality_audit"))
+        return result
     finally:
         conn.close()
 
@@ -234,11 +261,11 @@ def get_log(log_id: int, max_points: int = 3000):
         if log is None:
             raise HTTPException(404, f"日志 {log_id} 不存在")
         rows = conn.execute(
-            "SELECT t, voltage, current, temperature, cells FROM samples"
+            "SELECT t, voltage, current, temperature, cells, line_no FROM samples"
             " WHERE log_id=? ORDER BY t", (log_id,)).fetchall()
         stride = max(1, len(rows) // max_points + (1 if len(rows) % max_points else 0))
         samples = [[round(r["t"], 2), r["voltage"], r["current"], r["temperature"],
-                    json.loads(r["cells"]) if r["cells"] else None]
+                    json.loads(r["cells"]) if r["cells"] else None, r["line_no"]]
                    for r in rows[::stride]]
         cycles = [dict(r) for r in conn.execute(
             "SELECT * FROM cycles WHERE log_id=? ORDER BY seq",
@@ -250,6 +277,8 @@ def get_log(log_id: int, max_points: int = 3000):
         log_dict = dict(log)
         log_dict["cell_info"] = (json.loads(log_dict["cell_info"])
                                  if log_dict["cell_info"] else None)
+        log_dict["quality_audit"] = (json.loads(log_dict["quality_audit"])
+                                     if log_dict["quality_audit"] else None)
         return {"log": log_dict, "samples": samples, "cycles": cycles}
     finally:
         conn.close()
@@ -282,10 +311,71 @@ def _build_battery_assessment(conn, bid: int) -> dict:
         cycles.append(c)
     log_count = conn.execute(
         "SELECT COUNT(*) AS n FROM logs WHERE battery_id=?", (bid,)).fetchone()["n"]
+    # 数据质量审计证据随评估/导出保留（按日志完整区段与逐条证据）
+    log_rows = conn.execute(
+        "SELECT id, filename, imported_at, row_count, quality_audit"
+        " FROM logs WHERE battery_id=? ORDER BY id", (bid,)).fetchall()
+    log_audits = []
+    for r in log_rows:
+        audit = json.loads(r["quality_audit"]) if r["quality_audit"] else None
+        log_audits.append({
+            "log_id": r["id"], "filename": r["filename"],
+            "imported_at": r["imported_at"], "row_count": r["row_count"],
+            "quality_audit": audit,
+        })
     result = build_assessment(battery, cycles, log_count)
     result["battery"] = battery
+    result["data_quality"] = _summarize_quality(log_audits)
+    result["logs"] = log_audits
     result["generated_at"] = _now_iso()
     return result
+
+
+def _summarize_quality(log_audits: list[dict]) -> dict:
+    """跨日志聚合导入前质量审计结果，供评估页与导出 JSON 展示。"""
+    type_totals: dict[str, int] = {}
+    sev_totals = {"info": 0, "warning": 0, "critical": 0}
+    affected: set[str] = set()
+    logs_with_issues = 0
+    total_segments = 0
+    total_issues = 0
+    unordered_logs = 0
+    skipped_rows = 0
+    for entry in log_audits:
+        audit = entry["quality_audit"]
+        if not audit:
+            continue
+        skipped_rows += audit.get("skipped_rows", 0)
+        if not audit.get("time_ordered", True):
+            unordered_logs += 1
+        if audit.get("segment_count", 0):
+            logs_with_issues += 1
+        total_segments += audit.get("segment_count", 0)
+        total_issues += audit.get("issue_count", 0)
+        for typ, cnt in audit.get("counts_by_type", {}).items():
+            type_totals[typ] = type_totals.get(typ, 0) + cnt
+        for sev, cnt in audit.get("counts_by_severity", {}).items():
+            sev_totals[sev] = sev_totals.get(sev, 0) + cnt
+        affected.update(audit.get("affected_fields", []))
+    grade = "good"
+    if sev_totals["critical"] or unordered_logs:
+        grade = "critical"
+    elif sev_totals["warning"]:
+        grade = "fair"
+    elif sev_totals["info"]:
+        grade = "fair"
+    return {
+        "total_logs": len(log_audits),
+        "logs_with_issues": logs_with_issues,
+        "total_segments": total_segments,
+        "total_issues": total_issues,
+        "unordered_logs": unordered_logs,
+        "skipped_rows": skipped_rows,
+        "counts_by_type": type_totals,
+        "counts_by_severity": sev_totals,
+        "affected_fields": sorted(affected),
+        "quality_grade": grade,
+    }
 
 
 @app.get("/api/batteries/{bid}/assessment")

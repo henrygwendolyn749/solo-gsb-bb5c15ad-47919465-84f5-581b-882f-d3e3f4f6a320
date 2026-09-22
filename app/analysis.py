@@ -37,6 +37,7 @@ class Sample(NamedTuple):
     i: float      # 电流 A，正=放电，负=充电
     temp: float   # 温度 °C
     cells: Optional[tuple] = None  # 各单体电压 V；该行缺值/单体数漂移时为 None
+    line_no: Optional[int] = None  # CSV 物理行号（质量审计证据）
 
 
 @dataclass

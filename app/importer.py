@@ -1,4 +1,4 @@
-"""飞行日志 CSV 解析：表头别名识别、分隔符嗅探、时间列归一化。"""
+"""飞行日志 CSV 解析：表头别名识别、分隔符嗅探、时间列归一化、导入前质量审计。"""
 from __future__ import annotations
 
 import csv
@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .analysis import Sample
+from .audit import RawRecord, audit_records
 
 
 class CsvFormatError(ValueError):
@@ -145,8 +146,10 @@ def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
         if len(rec["rows"]) < 5:
             rec["rows"].append(line_no)
 
+    raw_records: list[RawRecord] = []
     samples: list[Sample] = []
     skipped = 0
+    skipped_lines: list[int] = []
     t0 = None
     epoch_based = False
     for line_no, row in enumerate(rows[1:], start=2):
@@ -157,10 +160,12 @@ def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
             tp = float(row[ci_tp])
         except (ValueError, IndexError, CsvFormatError):
             skipped += 1
+            skipped_lines.append(line_no)
             continue
         if t0 is None:
             t0 = tv
             epoch_based = is_epoch
+        raw_records.append(RawRecord(line_no=line_no, t=tv, v=v, i=i, temp=tp))
 
         cells: Optional[tuple] = None
         if cell_indices and not cell_disabled_reason:
@@ -198,10 +203,17 @@ def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
                 note_cell_skip("单体电压缺值", line_no)
             else:
                 cells = tuple(vals)
-        samples.append(Sample(t=tv - t0, v=v, i=i, temp=tp, cells=cells))
+        samples.append(Sample(t=tv - t0, v=v, i=i, temp=tp, cells=cells,
+                              line_no=line_no))
 
     if len(samples) < 10:
         raise CsvFormatError(f"有效数据行不足（{len(samples)} 行），至少需要 10 行")
+
+    # 导入前质量审计：基于 CSV 原始行序（排序之前），保留原始行号与绝对时间。
+    # 审计只产出证据，不修改样本、不阻断后续循环分析。
+    quality = audit_records(raw_records, time_is_epoch=epoch_based,
+                            skipped_rows=skipped,
+                            skipped_line_numbers=skipped_lines)
 
     samples.sort(key=lambda s: s.t)
     start_iso = (datetime.fromtimestamp(t0, tz=timezone.utc).isoformat()
@@ -227,5 +239,6 @@ def parse_flight_csv(text: str) -> tuple[list[Sample], dict]:
             if cell_indices and not cell_disabled_reason else 0,
             "skip_reasons": cell_skip,
         },
+        "quality_audit": quality,
     }
     return samples, meta

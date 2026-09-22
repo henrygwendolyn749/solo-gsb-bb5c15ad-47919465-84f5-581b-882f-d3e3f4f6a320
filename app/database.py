@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS logs (
     min_voltage   REAL,
     max_voltage   REAL,
     max_temp_c    REAL,
-    cell_info     TEXT
+    cell_info     TEXT,
+    quality_audit TEXT
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -40,7 +41,8 @@ CREATE TABLE IF NOT EXISTS samples (
     voltage     REAL NOT NULL,
     current     REAL NOT NULL,
     temperature REAL NOT NULL,
-    cells       TEXT
+    cells       TEXT,
+    line_no     INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_samples_log ON samples(log_id, t);
 
@@ -84,6 +86,10 @@ _MIGRATIONS = [
      "ALTER TABLE cycles ADD COLUMN cell_sustain_s REAL NOT NULL DEFAULT 0"),
     ("cycles", "cell_intervals",
      "ALTER TABLE cycles ADD COLUMN cell_intervals TEXT NOT NULL DEFAULT '[]'"),
+    ("logs", "quality_audit",
+     "ALTER TABLE logs ADD COLUMN quality_audit TEXT"),
+    ("samples", "line_no",
+     "ALTER TABLE samples ADD COLUMN line_no INTEGER"),
 ]
 
 

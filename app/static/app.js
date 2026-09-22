@@ -2,7 +2,10 @@
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
-const state = { batteries: [], currentId: null, currentLogId: null, logDetail: null };
+const state = {
+  batteries: [], currentId: null, currentLogId: null, logDetail: null,
+  qaFilter: "all",
+};
 
 async function api(path, opts = {}) {
   const res = await fetch(path, opts);
@@ -28,6 +31,60 @@ const fmtDur = (s) => {
   return `${m}分${String(sec).padStart(2, "0")}秒`;
 };
 const fmtTime = (iso) => iso ? new Date(iso).toLocaleString("zh-CN", { hour12: false }) : "—";
+
+/* ---------------- 数据质量审计 ---------------- */
+
+const Q_TYPE_LABELS = {
+  outlier: "稳健离群点",
+  out_of_order: "时间戳乱序",
+  duplicate_time: "重复时间戳",
+  interval_gap: "采样缺口",
+  interval_short: "过密采样",
+};
+const Q_SEV_LABELS = { critical: "严重", warning: "警告", info: "提示" };
+const Q_FIELD_LABELS = { time: "时间", voltage: "电压", current: "电流", temperature: "温度" };
+const Q_TYPE_COLORS = {
+  outlier: "#ef5350",
+  out_of_order: "#ff8a65",
+  duplicate_time: "#f0b429",
+  interval_gap: "#b388ff",
+  interval_short: "#64b5f6",
+};
+
+function qTypeLabel(t) { return Q_TYPE_LABELS[t] || t; }
+function qSevClass(sev) { return sev === "critical" ? "critical" : sev === "warning" ? "warning" : "info"; }
+function qFieldChips(fields) {
+  return fields.map((f) => `<span class="field-chip">${Q_FIELD_LABELS[f] || f}</span>`).join("");
+}
+function qualityGradeOf(qa) {
+  if (!qa) return "good";
+  if (!qa.time_ordered || qa.counts_by_severity.critical > 0) return "critical";
+  if (qa.counts_by_severity.warning > 0) return "fair";
+  if (qa.counts_by_severity.info > 0) return "fair";
+  return "good";
+}
+function qualityBadgeHtml(qa) {
+  if (!qa) return `<span class="qbadge good">未审计</span>`;
+  const g = qualityGradeOf(qa);
+  if (qa.segment_count === 0) return `<span class="qbadge good">✓ 无质量问题</span>`;
+  const label = g === "critical" ? "严重问题" : g === "fair" ? "存在问题" : "轻微提示";
+  return `<span class="qbadge ${g}">${label} · ${qa.segment_count} 区段 / ${qa.issue_count} 项</span>`;
+}
+
+function formatAuditOneLine(qa) {
+  if (!qa) return "";
+  if (qa.segment_count === 0) {
+    return `数据质量审计通过（${qa.parsed_rows} 行${qa.skipped_rows ? `，另有 ${qa.skipped_rows} 行无法解析已跳过` : ""}）。`;
+  }
+  const t = qa.counts_by_type;
+  const parts = [];
+  if (t.out_of_order) parts.push(`时间戳乱序 ${t.out_of_order} 处`);
+  if (t.duplicate_time) parts.push(`重复时间 ${t.duplicate_time} 处`);
+  if (t.interval_gap) parts.push(`采样缺口 ${t.interval_gap} 处`);
+  if (t.interval_short) parts.push(`过密采样 ${t.interval_short} 处`);
+  if (t.outlier) parts.push(`稳健离群点 ${t.outlier} 个`);
+  return `质量审计发现 ${qa.segment_count} 个区段（${parts.join("、")}），已保留证据且不影响循环分析。`;
+}
 
 /* ---------------- 电池列表 ---------------- */
 
@@ -86,6 +143,7 @@ async function selectBattery(id) {
   state.currentId = id;
   state.currentLogId = null;
   state.logDetail = null;
+  state.qaFilter = "all";
   document.querySelectorAll("#battery-list li").forEach((li) =>
     li.classList.toggle("active", Number(li.dataset.id) === Number(id)));
   $("#empty-tip").hidden = true;
@@ -168,6 +226,7 @@ $("#btn-upload").onclick = async () => {
         msg += `识别到单体列但未启用单体分析（${r.cells.disabled_reason}）。`;
       }
     }
+    msg += formatAuditOneLine(r.quality_audit);
     $("#upload-result").textContent = msg;
     input.value = "";
     await Promise.all([loadAssessment(), loadLogs(), loadBatteries(true)]);
@@ -186,8 +245,10 @@ async function loadLogs() {
     tr.innerHTML = `<td>${l.id}</td><td></td><td>${fmtTime(l.imported_at)}</td>
       <td>${fmtDur(l.duration_s)}</td><td>${l.row_count}</td>
       <td>${l.discharge_cycles} / ${l.charge_cycles}</td>
+      <td class="qcell"></td>
       <td><button class="danger" data-del="${l.id}">删除</button></td>`;
     tr.children[1].textContent = l.filename;
+    tr.children[6].innerHTML = qualityBadgeHtml(l.quality);
     tr.onclick = (e) => {
       if (e.target.dataset.del) return;
       selectLog(l.id, tr);
@@ -208,7 +269,7 @@ async function loadLogs() {
     tbody.appendChild(tr);
   }
   if (!logs.length) {
-    tbody.innerHTML = `<tr><td colspan="7" class="muted">暂无日志，请上传 CSV。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="muted">暂无日志，请上传 CSV。</td></tr>`;
   }
 }
 
@@ -250,6 +311,32 @@ async function loadAssessment() {
     : `<li class="info"><span class="badge">正常</span>未发现异常标记。</li>`;
 
   drawTrend(a.trend, a.battery.rated_capacity_ah);
+  renderQualitySummary(a.data_quality, a.logs);
+}
+
+function renderQualitySummary(dq, logs) {
+  const el = $("#quality-summary");
+  if (!dq || !dq.total_logs) { el.innerHTML = ""; return; }
+  const t = dq.counts_by_type || {};
+  const items = [
+    ["审计日志", `${dq.logs_with_issues}/${dq.total_logs} 份含问题`,
+     dq.logs_with_issues ? "fair" : "good"],
+    ["质量区段", dq.total_segments, dq.total_segments ? "fair" : "good"],
+    ["问题项总数", dq.total_issues, dq.total_issues ? "fair" : "good"],
+    ["时间戳乱序日志", dq.unordered_logs, dq.unordered_logs ? "critical" : "good"],
+    ["稳健离群点", t.outlier || 0, t.outlier ? "fair" : "good"],
+    ["重复时间戳", t.duplicate_time || 0, t.duplicate_time ? "fair" : "good"],
+    ["采样缺口", t.interval_gap || 0, t.interval_gap ? "fair" : "good"],
+    ["过密采样", t.interval_short || 0, t.interval_short ? "fair" : "good"],
+    ["无法解析跳过行", dq.skipped_rows, dq.skipped_rows ? "fair" : "good"],
+  ];
+  const affected = (dq.affected_fields || []).map((f) => Q_FIELD_LABELS[f] || f);
+  el.innerHTML = `<div class="quality-metrics">${items.map(([k, v, cls]) =>
+    `<div class="metric"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`
+  ).join("")}</div>
+  <p class="muted">受影响字段：${affected.length ? affected.join("、") : "无"}。
+  质量问题仅作为证据保留，不阻断任何可解析行的循环分析。
+  完整逐区段证据见各日志详情与导出 JSON（<code>data_quality</code> / <code>logs[].quality_audit</code>）。</p>`;
 }
 
 /* ---------------- 日志详情与图表 ---------------- */
@@ -265,7 +352,8 @@ async function selectLog(logId, rowEl) {
     $("#log-title").textContent =
       `日志 #${logId}：${d.log.filename}（${d.log.row_count} 行样本）`;
     renderCyclesTable(d.cycles);
-    drawLogChart(d.samples, d.cycles);
+    renderQualityPanel(d.log.quality_audit);
+    drawLogChart(d.samples, d.cycles, d.log.quality_audit);
     $("#log-detail").scrollIntoView({ behavior: "smooth", block: "start" });
   } catch (err) { toast(err.message, true); }
 }
@@ -303,6 +391,76 @@ function renderCyclesTable(cycles) {
   }
 }
 
+/* ---------------- 日志质量审计面板 ---------------- */
+
+function renderQualityPanel(qa) {
+  const panel = $("#quality-panel");
+  if (!qa) { panel.hidden = true; return; }
+  panel.hidden = false;
+  $("#quality-panel-sub").textContent =
+    `共 ${qa.parsed_rows} 行可解析${qa.skipped_rows ? `，${qa.skipped_rows} 行无法解析已跳过` : ""}` +
+    ` · 典型采样间隔 ${qa.interval.sample_interval_s !== null ? qa.interval.sample_interval_s + "s" : "—"}`;
+
+  const cs = qa.counts_by_severity || {};
+  const metrics = [
+    ["质量区段", qa.segment_count, qa.segment_count ? "fair" : "good"],
+    ["问题项", qa.issue_count, qa.issue_count ? "fair" : "good"],
+    ["严重", cs.critical || 0, cs.critical ? "critical" : "good"],
+    ["警告", cs.warning || 0, cs.warning ? "fair" : "good"],
+    ["提示", cs.info || 0, cs.info ? "fair" : "good"],
+    ["乱序", qa.time_ordered ? 0 : 1, qa.time_ordered ? "good" : "critical"],
+  ];
+  $("#quality-metrics").innerHTML = metrics.map(([k, v, cls]) =>
+    `<div class="metric"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`).join("");
+
+  const filterable = ["all", ...Object.keys(Q_TYPE_LABELS)];
+  const counts = qa.counts_by_type;
+  $("#quality-filters").innerHTML = filterable.map((typ) => {
+    const n = typ === "all" ? qa.segment_count : (counts[typ] || 0);
+    const active = state.qaFilter === typ ? " active" : "";
+    const label = typ === "all" ? "全部" : qTypeLabel(typ);
+    return `<button class="qfilter${active}" data-qfilter="${typ}">${label} (${n})</button>`;
+  }).join("");
+  document.querySelectorAll("#quality-filters .qfilter").forEach((btn) => {
+    btn.onclick = () => {
+      state.qaFilter = btn.dataset.qfilter;
+      renderQualityPanel(qa);
+      drawLogChart(state.logDetail.samples, state.logDetail.cycles,
+                   state.logDetail.log.quality_audit);
+    };
+  });
+
+  renderQualitySegments(qa);
+}
+
+function renderQualitySegments(qa) {
+  const ul = $("#quality-segments");
+  let segs = qa.segments || [];
+  if (state.qaFilter !== "all") segs = segs.filter((s) => s.type === state.qaFilter);
+  if (!segs.length) {
+    ul.innerHTML = qa.segment_count === 0
+      ? `<li class="qitem good"><span class="qbadge good">✓ 通过</span>未发现时间戳或电压/电流/温度数据质量问题。</li>`
+      : `<li class="muted">该筛选下暂无区段。</li>`;
+    return;
+  }
+  ul.innerHTML = segs.map((s) => {
+    const when = s.time_start
+      ? `${fmtTime(s.time_start)} ~ ${fmtTime(s.time_end)}`
+      : `t = ${s.rel_start_s}s ~ ${s.rel_end_s}s`;
+    return `<li class="qitem ${qSevClass(s.severity)}">
+      <div class="qhead">
+        <span class="badge">${Q_SEV_LABELS[s.severity] || s.severity}</span>
+        <span class="qtype" style="color:${Q_TYPE_COLORS[s.type]}">${s.type_label}</span>
+        <span class="muted">第 ${s.line_start}~${s.line_end} 行 · ${when} · 涉 ${s.sample_count} 行</span>
+      </div>
+      <div class="qmsg">${s.message}</div>
+      <div class="qfields">${qFieldChips(s.fields)}</div>
+      <pre class="qevidence">${JSON.stringify(s.evidence, null, 1)}</pre>
+      ${s.details_truncated ? `<div class="muted">逐条证据较多，仅展示前 ${s.details.length} / ${s.issue_count} 项；完整统计见上方汇总。</div>` : ""}
+    </li>`;
+  }).join("");
+}
+
 /* ---------------- Canvas 绘图 ---------------- */
 
 function setupCanvas(canvas) {
@@ -316,7 +474,7 @@ function setupCanvas(canvas) {
   return [ctx, w, h];
 }
 
-function drawLogChart(samples, cycles) {
+function drawLogChart(samples, cycles, qa) {
   const canvas = $("#log-chart");
   const [ctx, W, H] = setupCanvas(canvas);
   let cellPresent = false, cellMaxN = 0;
@@ -436,6 +594,38 @@ function drawLogChart(samples, cycles) {
     }
     cellRange = { min: mn, max: mx, n: cellN };
   }
+
+  // 数据质量审计标记：按筛选后的区段，在样本点上以菱形标记定位（含原始行号）
+  const qMarkers = [];
+  if (qa && qa.segments && samples.length) {
+    const byLine = new Map();
+    for (const p of samples) {
+      if (p[5] !== null && p[5] !== undefined) byLine.set(p[5], p);
+    }
+    for (const seg of qa.segments) {
+      if (state.qaFilter !== "all" && seg.type !== state.qaFilter) continue;
+      const color = Q_TYPE_COLORS[seg.type] || "#fff";
+      if (seg.type === "interval_gap" || seg.type === "interval_short") {
+        // 区间型：半透明竖带 + 起止行三角
+        ctx.fillStyle = color + "22";
+        ctx.fillRect(x(seg.rel_start_s), padT,
+          Math.max(x(seg.rel_end_s) - x(seg.rel_start_s), 2), ih);
+      }
+      for (const ln of Array.from(new Set(seg.lines || [seg.line_start, seg.line_end]))) {
+        const p = byLine.get(ln);
+        if (p) qMarkers.push({ p, color, seg });
+      }
+    }
+    for (const m of qMarkers) {
+      const px = x(m.p[0]);
+      const py = series[0].y(m.p[1]); // 标记锚定在电压曲线
+      ctx.fillStyle = m.color;
+      ctx.beginPath();
+      ctx.moveTo(px, py - 5); ctx.lineTo(px + 5, py);
+      ctx.lineTo(px, py + 5); ctx.lineTo(px - 5, py);
+      ctx.closePath(); ctx.fill();
+    }
+  }
   $("#chart-legend").innerHTML =
     series.map((s) =>
       `<span><span class="dot" style="background:${s.color}"></span>${s.name}
@@ -450,6 +640,14 @@ function drawLogChart(samples, cycles) {
         Array.from({ length: cellRange.n }, (_, k) =>
           `<span class="dot" style="background:${CELL_COLORS[k % CELL_COLORS.length]}"></span>#${k + 1}`).join(" ") +
         "</span>"
+      : "") +
+    (qa && qa.segments && qa.segments.length
+      ? `<span class="qlegend">质量审计：` +
+        Object.entries(Q_TYPE_LABELS).map(([t, lab]) =>
+          qa.counts_by_type[t]
+            ? `<span class="dot" style="background:${Q_TYPE_COLORS[t]}"></span>${lab} ${qa.counts_by_type[t]}`
+            : "").join(" ") +
+        `（筛选：${state.qaFilter === "all" ? "全部" : qTypeLabel(state.qaFilter)}；菱形按原始行号锚定）</span>`
       : "");
 }
 
@@ -494,7 +692,8 @@ function drawTrend(trend, ratedAh) {
 
 window.addEventListener("resize", () => {
   if (state.logDetail && !$("#log-detail").hidden) {
-    drawLogChart(state.logDetail.samples, state.logDetail.cycles);
+    drawLogChart(state.logDetail.samples, state.logDetail.cycles,
+                 state.logDetail.log.quality_audit);
   }
 });
 loadBatteries();

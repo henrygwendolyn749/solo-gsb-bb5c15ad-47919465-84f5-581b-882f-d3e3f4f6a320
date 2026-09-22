@@ -173,3 +173,62 @@ canvas { width: 100%; background: #121829; border-radius: 8px; }
 @media (max-width: 900px) {
   #layout { grid-template-columns: 1fr; }
 }
+
+/* ---------------- 数据质量审计 ---------------- */
+.qcell { white-space: nowrap; text-align: right; }
+.qbadge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.qbadge.good { background: #1d4d3a; color: #7fe0b2; }
+.qbadge.fair { background: #5a4a1a; color: #ffd54f; }
+.qbadge.critical { background: #5a2323; color: #ff8a80; }
+
+.quality-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 8px 0;
+}
+.quality-metrics .metric { padding: 8px 10px; }
+.quality-metrics .metric .v { font-size: 17px; }
+
+.quality-filters { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+.qfilter {
+  background: #22304f; color: var(--muted);
+  font-size: 12px; padding: 4px 10px; font-weight: 500;
+}
+.qfilter.active { background: var(--accent); color: #08111f; font-weight: 700; }
+
+.qlist { list-style: none; padding: 0; margin: 0; }
+.qitem {
+  border-left: 3px solid var(--info);
+  background: #121829;
+  padding: 8px 12px;
+  border-radius: 0 6px 6px 0;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.qitem.warning { border-left-color: var(--warn); }
+.qitem.critical { border-left-color: var(--crit); }
+.qitem.good { border-left-color: var(--good); }
+.qhead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.qtype { font-weight: 700; font-size: 12.5px; }
+.qmsg { margin: 5px 0; line-height: 1.6; }
+.qfields { margin: 4px 0; display: flex; gap: 5px; flex-wrap: wrap; }
+.field-chip {
+  font-size: 11px; padding: 1px 8px; border-radius: 10px;
+  background: #2c3a5c; color: #b8c6e3;
+}
+.qevidence {
+  margin: 6px 0 2px; padding: 7px 9px;
+  background: #0d1322; border: 1px solid var(--border); border-radius: 6px;
+  color: #8fa3c8; font-size: 11px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow: auto;
+}
+.qlegend .dot { vertical-align: middle; }

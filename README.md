@@ -17,7 +17,10 @@
   - 过放 / 过压：电压超出用户设定的安全范围
   - 单体失衡：单体最大压差连续超过 0.10 V 达 5 秒（短暂尖峰不告警）
 - **趋势摘要**：SOH（最佳容量/额定容量）、近期衰减、每循环衰减率、健康等级
-- **JSON 导出**：按电池一键导出完整评估结果
+- **导入前数据质量审计**：解析时保留 CSV 原始行号，在时间排序之前检查时间戳乱序、
+  重复时间、异常采样间隔（缺口/过密）与电压/电流/温度的稳健离群点；相邻问题自动
+  合并为质量区段，审计证据随导入与导出 JSON 保留，**绝不阻断可解析行的循环分析**
+- **JSON 导出**：按电池一键导出完整评估结果（含全部质量审计证据）
 
 ## 快速开始
 
@@ -50,6 +53,12 @@ python3 scripts/generate_sample.py   # 生成 sample_data/sample_flight_1.csv �
 两份样例均含 6 节单体电压：样例 1 只有一次瞬时压差尖峰（不告警）；样例 2 第 6 节
 单体持续偏弱并带有 4 s 采样断点与一行缺值（生成单体失衡标记，区间被断点切分，
 缺值行被跳过）。
+
+第三份 `sample_flight_3_quality.csv` 用于演示**导入前数据质量审计**：静置段电流、
+放电段电压与温度各有一个孤立坏点（稳健离群点），另有一次相邻行时间戳交换（乱序）、
+一行重复时间戳与一处 30 s 采样缺口。上传后日志详情页的"导入前数据质量审计"面板会
+逐区段给出类型、起止行（CSV 物理行号）、时间范围、受影响字段与统计证据，可用类型
+按钮筛选；尽管存在上述问题，放电/充电循环仍被正常识别。
 
 ## CSV 格式
 
@@ -93,11 +102,11 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 | POST | `/api/batteries` | 新建电池（额定容量、安全电压范围） |
 | GET | `/api/batteries` | 电池列表（含日志数、放电循环数） |
 | GET / PATCH / DELETE | `/api/batteries/{id}` | 查询 / 修改 / 删除电池 |
-| POST | `/api/batteries/{id}/logs` | 上传 CSV 并完成循环分析（multipart） |
-| GET | `/api/batteries/{id}/logs` | 该电池的日志列表 |
-| GET / DELETE | `/api/logs/{id}` | 日志详情（样本 + 循环）/ 删除 |
-| GET | `/api/batteries/{id}/assessment` | 汇总评估（摘要、标记、趋势、循环明细） |
-| GET | `/api/batteries/{id}/export` | 下载评估 JSON 文件 |
+| POST | `/api/batteries/{id}/logs` | 上传 CSV 并完成质量审计 + 循环分析（multipart） |
+| GET | `/api/batteries/{id}/logs` | 该电池的日志列表（含每日志紧凑质量摘要 `quality`） |
+| GET / DELETE | `/api/logs/{id}` | 日志详情（样本含原始行号 + 完整审计 + 循环）/ 删除 |
+| GET | `/api/batteries/{id}/assessment` | 汇总评估（摘要、质量汇总 `data_quality`、标记、趋势、循环与各日志审计） |
+| GET | `/api/batteries/{id}/export` | 下载评估 JSON 文件（保留全部审计证据） |
 
 交互式 API 文档：<http://localhost:8000/docs>
 
@@ -117,6 +126,10 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 | 单体失衡持续时长 | ≥ 5 s（连续超差才告警，短暂尖峰不告警） |
 | 单体采样断点 | 相邻有效单体样本间隔 > 2 s 中断连续区间 |
 | 健康等级 | 综合严重标记数、SOH（<60/70/85%）与衰减率分档 |
+| 质量审计-离群点 | 局部残差修正 z 分数（MAD，阈值 3.5），噪声地板 0.08 V / 1.5 A / 1.0 °C |
+| 质量审计-采样缺口 | 间隔 ≥ 3× 中位数且 ≥ 2 s |
+| 质量审计-过密采样 | 间隔 ≤ 中位数 1/3 且 ≤ 0.5 s |
+| 质量审计-区段合并 | 同类相邻问题行号差 ≤ 2 行 |
 
 **单体失衡判定**：对每个已识别循环，取该行各单体电压的最大压差
 `max(cell) − min(cell)`；按**时间戳累计**（非采样点数，采样间隔不规则同样适用）
@@ -131,15 +144,75 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 终点取静置恢复电压与卸载前电压之差除以卸载电流，两处估计取平均；
 充电段取相反符号，结果以 mΩ 展示。
 
+## 导入前数据质量审计
+
+每份 CSV 在**时间排序之前、按原始行序**执行一次质量审计（`app/audit.py`），
+每个样本保留其 CSV 物理行号（表头为第 1 行）。审计只产生证据，不修改、剔除
+任何可解析样本，也不会因质量问题使导入失败——循环分析始终在时间排序后的全部
+可解析行上照常进行；无法解析的行仍按原逻辑计入跳过统计并保留行号证据。
+
+### 检查项
+
+| 类型 code | 含义 | 判定方法 |
+| --- | --- | --- |
+| `out_of_order` | 时间戳乱序 | 后行时间戳早于紧邻前行（回退秒数记入证据） |
+| `duplicate_time` | 重复时间戳 | 与文件中首次出现的该时间戳相同（记录对照行） |
+| `interval_gap` | 采样缺口 | 相邻正间隔 ≥ 3× 全日志正间隔中位数 **且** ≥ 2 s |
+| `interval_short` | 过密采样 | 相邻正间隔 ≤ 中位数的 1/3 **且** ≤ 0.5 s |
+| `outlier` | 电压 / 电流 / 温度稳健离群点 | 逐点相对**局部邻域基线**（前/后各 8 个邻居的中位数，取更近的一侧）的残差做 MAD 修正 z 分数，\|z\| ≥ 3.5 |
+
+离群判定基于局部上下文而非全局中位数：飞行日志是静置/放电/充电多工况序列，
+全局统计会把正常工况切换误判为离群；局部基线下，放电开始/结束的真实阶跃贴合
+新工况不报，只有脱离两侧邻居的孤立坏点（尖峰/深跌）才报。残差 MAD 为 0
+（数据高度平滑）时使用各通道的传感器噪声地板（电压 0.08 V / 电流 1.5 A /
+温度 1.0 °C），避免正常测量抖动被放大为离群。
+
+### 质量区段合并与证据
+
+行号相邻（间隔 ≤ 2 行）的**同类**问题自动合并为一个区段，每个区段记录：
+
+- `type` / `type_label` / `severity`（info / warning / critical）
+- `line_start` / `line_end` / `sample_count`：CSV 物理行范围与涉及行数
+- `time_start` / `time_end`（epoch 时间戳给 UTC ISO 字符串，数值秒给 `null`）
+  与相对日志起点的 `rel_start_s` / `rel_end_s`
+- `fields` / `field_labels`：受影响字段（`time` / `voltage` / `current` /
+  `temperature`；同一行多个通道离群时合并并列出全部字段）
+- `message`：可直接阅读的中文说明
+- `evidence`：判定方法与阈值、通道稳健尺度（全局中位数、残差 σ、噪声地板）、
+  每字段最大 \|z\| 与极端行、间隔类的典型间隔与极值
+- `details`：逐条问题证据（行号、数值、z 分数、对照行/时间等），每区段最多
+  保留 20 条，超出时 `details_truncated=true`，统计计数不受影响
+
+摘要字段 `counts_by_type` / `counts_by_severity` / `affected_fields` /
+`time_ordered` / `interval.sample_interval_s` / `outliers.scales` 等与
+区段列表一并存放于 `logs.quality_audit`。
+
+### 页面与接口
+
+- **导入结果**：上传提示追加一行审计结论（区段数与类型分布）。
+- **日志列表**：每行显示质量徽标（无问题 / 存在问题 / 严重问题 + 区段数），
+  数据来自列表接口的紧凑摘要 `quality`。
+- **日志详情**："导入前数据质量审计"面板给出质量摘要指标、**按类型筛选区段**
+  的按钮与区段证据列表；曲线图按筛选结果叠加质量标记（菱形按**原始行号**锚定
+  到对应样本，缺口/过密以竖带表示）。
+- **健康评估页**：跨日志的"导入数据质量摘要"（含问题日志数、乱序日志数、
+  各类型计数、受影响字段）。
+- **JSON 导出**：顶层 `data_quality` 为跨日志汇总，`logs[].quality_audit`
+  保留每份日志的完整区段与逐条证据。
+
+旧版 SQLite 数据库在应用启动时自动补列（`logs.quality_audit`、
+`samples.line_no`），历史日志的审计字段为空，页面显示"未审计"，不影响使用。
+
 ## 项目结构
 
 ```
 app/
   main.py        FastAPI 路由与启动钩子（启动时初始化 SQLite）
-  database.py    SQLite 连接与建表
+  database.py    SQLite 连接与建表（含旧库自动迁移：质量审计列、样本原始行号列）
   analysis.py    状态机循环识别、库仑积分、内阻估算、单体压差连续性判定、判定与汇总
-  importer.py    CSV 解析（列名别名、单体列识别、分隔符嗅探、时间归一化）
+  audit.py       导入前质量审计（乱序/重复/异常间隔 + 局部残差 MAD 稳健离群点、区段合并）
+  importer.py    CSV 解析（列名别名、单体列识别、分隔符嗅探、时间归一化、排序前审计）
   static/        原生前端（index.html / app.js / style.css）
-scripts/generate_sample.py   演示数据生成器
+scripts/generate_sample.py   演示数据生成器（含质量缺陷样例 sample_flight_3_quality.csv）
 Dockerfile / docker-compose.yml
 ```
